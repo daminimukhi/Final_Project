@@ -1,4 +1,4 @@
-# Mental Health Prediction using BERT + BiLSTM
+# Mental Health Prediction using BERT + BiLSTM (with validation, early stopping, saving model)
 
 import os
 import pandas as pd
@@ -6,14 +6,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from transformers import BertTokenizer, BertModel
-from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report, confusion_matrix
-import kagglehub
-import re
+from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report, confusion_matrix, precision_recall_fscore_support
+from sklearn.utils.class_weight import compute_class_weight
+from collections import Counter
 import matplotlib.pyplot as plt
 import seaborn as sns
+import numpy as np
+import kagglehub
+import re
 
 # Step 1: Download and load dataset
-print("\U0001F4C5 Downloading dataset...")
+print("Downloading dataset...")
 dataset_dir = kagglehub.dataset_download("souvikahmed071/social-media-and-mental-health")
 csv_file = next(f for f in os.listdir(dataset_dir) if f.endswith('.csv'))
 df = pd.read_csv(os.path.join(dataset_dir, csv_file))
@@ -27,14 +30,18 @@ target_col = '13_on_a_scale_of_1_to_5_how_much_are_you_bothered_by_worries'
 df.dropna(subset=[text_col, target_col], inplace=True)
 df[target_col] = df[target_col].astype(str)
 
-# Sort unique labels
-unique_labels = sorted(df[target_col].unique(), key=lambda x: int(re.search(r'\d+', x).group()) if re.search(r'\d+', x) else x)
+unique_labels = sorted(df[target_col].unique(), key=lambda x: int(re.search(r'\d+', x).group()))
 label_map = {label: idx for idx, label in enumerate(unique_labels)}
 reverse_label_map = {v: k for k, v in label_map.items()}
 df['label'] = df[target_col].map(label_map)
 class_names = [reverse_label_map[i] for i in range(len(label_map))]
 
-# Step 4: Tokenization
+print("\nLabel distribution:")
+label_counts = Counter(df['label'])
+for label, count in label_counts.items():
+    print(f"Class {label} ({reverse_label_map[label]}): {count} samples")
+
+# Step 4: Tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
 # Step 5: Dataset class
@@ -61,10 +68,11 @@ class MentalHealthDataset(Dataset):
         return {
             'input_ids': encoding['input_ids'].squeeze(),
             'attention_mask': encoding['attention_mask'].squeeze(),
-            'label': torch.tensor(self.labels[idx], dtype=torch.long)
+            'label': torch.tensor(self.labels[idx], dtype=torch.long),
+            'text': self.texts[idx]
         }
 
-# Step 6: Split dataset
+# Step 6: Prepare data
 texts = df[text_col].tolist()
 labels = df['label'].tolist()
 dataset = MentalHealthDataset(texts, labels, tokenizer)
@@ -74,77 +82,126 @@ train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=16)
 
-# Step 7: Define model
+# Step 7: Model
 class BERT_LSTM(nn.Module):
     def __init__(self, hidden_dim=128, num_classes=len(label_map)):
-        super(BERT_LSTM, self).__init__()
+        super().__init__()
         self.bert = BertModel.from_pretrained("bert-base-uncased")
         self.lstm = nn.LSTM(768, hidden_dim, batch_first=True, bidirectional=True)
         self.dropout = nn.Dropout(0.3)
         self.fc = nn.Linear(hidden_dim * 2, num_classes)
 
     def forward(self, input_ids, attention_mask):
-        with torch.no_grad():
-            bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        bert_output = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         lstm_out, _ = self.lstm(bert_output.last_hidden_state)
-        pooled = torch.mean(lstm_out, 1)
-        output = self.dropout(pooled)
-        return self.fc(output)
+        pooled = torch.mean(lstm_out, dim=1)
+        return self.fc(self.dropout(pooled))
 
-# Step 8: Training and evaluation
-
+# Step 8: Training setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = BERT_LSTM().to(device)
-criterion = nn.CrossEntropyLoss()
+weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
+criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float).to(device))
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
 
-def train_model():
+# Step 9: Train with validation and early stopping
+best_val_acc = 0.0
+patience = 3
+epochs_no_improve = 0
+train_losses, val_accuracies = [], []
+
+for epoch in range(10):
     model.train()
-    for epoch in range(3):
-        total_loss = 0
-        for batch in train_loader:
-            input_ids = batch['input_ids'].to(device)
-            attention_mask = batch['attention_mask'].to(device)
-            labels = batch['label'].to(device)
+    total_loss = 0
+    for batch in train_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        targets = batch['label'].to(device)
 
-            optimizer.zero_grad()
-            outputs = model(input_ids, attention_mask)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-        print(f"\U0001F4DA Epoch {epoch + 1} - Loss: {total_loss / len(train_loader):.4f}")
+        optimizer.zero_grad()
+        outputs = model(input_ids, attention_mask)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
 
-def evaluate_model():
+    train_losses.append(total_loss / len(train_loader))
+    print(f"Epoch {epoch+1} Training Loss: {train_losses[-1]:.4f}")
+
+    # Validation
     model.eval()
-    predictions, targets = [], []
+    predictions, targets_val = [], []
     with torch.no_grad():
         for batch in val_loader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
-
             outputs = model(input_ids, attention_mask)
             preds = torch.argmax(outputs, dim=1)
-
             predictions.extend(preds.cpu().numpy())
-            targets.extend(labels.cpu().numpy())
+            targets_val.extend(labels.cpu().numpy())
 
-    print("\n\U0001F4CA Classification Report:\n", classification_report(targets, predictions, target_names=class_names))
-    print("✅ Accuracy:", accuracy_score(targets, predictions))
-    print("✅ Precision:", precision_score(targets, predictions, average='weighted', zero_division=0))
-    print("✅ Recall:", recall_score(targets, predictions, average='weighted', zero_division=0))
+    val_acc = accuracy_score(targets_val, predictions)
+    val_accuracies.append(val_acc)
+    print(f"Validation Accuracy: {val_acc:.4f}\n")
 
-    cm = confusion_matrix(targets, predictions, labels=list(range(len(class_names))))
-    plt.figure(figsize=(6, 5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
-    plt.title("Confusion Matrix")
-    plt.xlabel("Predicted")
-    plt.ylabel("Actual")
-    plt.tight_layout()
-    plt.savefig("confusion_matrix.png")
-    plt.show()
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        epochs_no_improve = 0
+        torch.save(model.state_dict(), "best_model.pt")
+        print("✅ Best model saved.")
+    else:
+        epochs_no_improve += 1
+        if epochs_no_improve >= patience:
+            print("⛔ Early stopping triggered.")
+            break
 
-# Step 9: Execute
-train_model()
-evaluate_model()
+# Step 10: Evaluation
+model.load_state_dict(torch.load("best_model.pt"))
+model.eval()
+predictions, targets, texts = [], [], []
+
+with torch.no_grad():
+    for batch in val_loader:
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
+        outputs = model(input_ids, attention_mask)
+        preds = torch.argmax(outputs, dim=1)
+        predictions.extend(preds.cpu().numpy())
+        targets.extend(labels.cpu().numpy())
+        texts.extend(batch['text'])
+
+unique_labels = sorted(set(targets + predictions))
+class_names_eval = [reverse_label_map[i] for i in unique_labels]
+
+print("\nClassification Report:")
+print(classification_report(targets, predictions, target_names=class_names_eval))
+print("Accuracy:", accuracy_score(targets, predictions))
+
+cm = confusion_matrix(targets, predictions, labels=unique_labels)
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names_eval, yticklabels=class_names_eval)
+plt.title("Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues', xticklabels=class_names_eval, yticklabels=class_names_eval)
+plt.title("Normalized Confusion Matrix")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+plt.show()
+
+# Plot Learning Curve
+plt.plot(train_losses, label='Training Loss')
+plt.plot(val_accuracies, label='Validation Accuracy')
+plt.title("Learning Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Metric")
+plt.legend()
+plt.tight_layout()
+plt.savefig("learning_curve.png")
+plt.show()
