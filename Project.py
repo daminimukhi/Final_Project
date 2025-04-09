@@ -1,12 +1,14 @@
-# Mental Health Prediction using BERT + BiLSTM (with validation, early stopping, saving model)
+# Mental Health Prediction using BERT + BiLSTM (Final Complete Version)
 
 import os
+import random
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer, BertModel
-from sklearn.metrics import accuracy_score, precision_score, recall_score, classification_report, confusion_matrix, precision_recall_fscore_support
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, precision_recall_fscore_support
 from sklearn.utils.class_weight import compute_class_weight
 from collections import Counter
 import matplotlib.pyplot as plt
@@ -15,16 +17,23 @@ import numpy as np
 import kagglehub
 import re
 
-# Step 1: Download and load dataset
+# Set seed for reproducibility
+SEED = 42
+random.seed(SEED)
+torch.manual_seed(SEED)
+torch.cuda.manual_seed_all(SEED)
+np.random.seed(SEED)
+
+# Download and load dataset
 print("Downloading dataset...")
 dataset_dir = kagglehub.dataset_download("souvikahmed071/social-media-and-mental-health")
 csv_file = next(f for f in os.listdir(dataset_dir) if f.endswith('.csv'))
 df = pd.read_csv(os.path.join(dataset_dir, csv_file))
 
-# Step 2: Clean column names
+# Clean column names
 df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_').str.replace(r'[^\w\s]', '', regex=True)
 
-# Step 3: Select and prepare columns
+# Select and prepare columns
 text_col = '16_following_the_previous_question_how_do_you_feel_about_these_comparisons_generally_speaking'
 target_col = '13_on_a_scale_of_1_to_5_how_much_are_you_bothered_by_worries'
 df.dropna(subset=[text_col, target_col], inplace=True)
@@ -36,15 +45,10 @@ reverse_label_map = {v: k for k, v in label_map.items()}
 df['label'] = df[target_col].map(label_map)
 class_names = [reverse_label_map[i] for i in range(len(label_map))]
 
-print("\nLabel distribution:")
-label_counts = Counter(df['label'])
-for label, count in label_counts.items():
-    print(f"Class {label} ({reverse_label_map[label]}): {count} samples")
-
-# Step 4: Tokenizer
+# Tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
 
-# Step 5: Dataset class
+# Dataset class
 class MentalHealthDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=128):
         self.texts = texts
@@ -72,17 +76,16 @@ class MentalHealthDataset(Dataset):
             'text': self.texts[idx]
         }
 
-# Step 6: Prepare data
+# Split data
 texts = df[text_col].tolist()
 labels = df['label'].tolist()
-dataset = MentalHealthDataset(texts, labels, tokenizer)
-train_size = int(0.8 * len(dataset))
-val_size = len(dataset) - train_size
-train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+X_train, X_val, y_train, y_val = train_test_split(texts, labels, test_size=0.2, stratify=labels, random_state=SEED)
+train_dataset = MentalHealthDataset(X_train, y_train, tokenizer)
+val_dataset = MentalHealthDataset(X_val, y_val, tokenizer)
 train_loader = DataLoader(train_dataset, batch_size=16, shuffle=True)
 val_loader = DataLoader(val_dataset, batch_size=16)
 
-# Step 7: Model
+# Model
 class BERT_LSTM(nn.Module):
     def __init__(self, hidden_dim=128, num_classes=len(label_map)):
         super().__init__()
@@ -97,20 +100,21 @@ class BERT_LSTM(nn.Module):
         pooled = torch.mean(lstm_out, dim=1)
         return self.fc(self.dropout(pooled))
 
-# Step 8: Training setup
+# Training setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = BERT_LSTM().to(device)
 weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
 criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float).to(device))
 optimizer = torch.optim.Adam(model.parameters(), lr=2e-5)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.5)
 
-# Step 9: Train with validation and early stopping
+# Training loop
 best_val_acc = 0.0
 patience = 3
 epochs_no_improve = 0
-train_losses, val_accuracies = [], []
+train_losses, val_losses, val_accuracies = [], [], []
 
-for epoch in range(10):
+for epoch in range(15):
     model.train()
     total_loss = 0
     for batch in train_loader:
@@ -122,44 +126,50 @@ for epoch in range(10):
         outputs = model(input_ids, attention_mask)
         loss = criterion(outputs, targets)
         loss.backward()
+        nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item()
 
-    train_losses.append(total_loss / len(train_loader))
-    print(f"Epoch {epoch+1} Training Loss: {train_losses[-1]:.4f}")
+    avg_train_loss = total_loss / len(train_loader)
+    train_losses.append(avg_train_loss)
+    scheduler.step()
 
-    # Validation
     model.eval()
-    predictions, targets_val = [], []
+    predictions, targets_val, probs_val = [], [], []
+    val_loss_total = 0
     with torch.no_grad():
         for batch in val_loader:
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
             outputs = model(input_ids, attention_mask)
-            preds = torch.argmax(outputs, dim=1)
+            loss = criterion(outputs, labels)
+            val_loss_total += loss.item()
+            probs = torch.softmax(outputs, dim=1)
+            preds = torch.argmax(probs, dim=1)
             predictions.extend(preds.cpu().numpy())
+            probs_val.extend(probs.cpu().numpy())
             targets_val.extend(labels.cpu().numpy())
 
     val_acc = accuracy_score(targets_val, predictions)
+    val_losses.append(val_loss_total / len(val_loader))
     val_accuracies.append(val_acc)
-    print(f"Validation Accuracy: {val_acc:.4f}\n")
+    print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, Val Loss={val_losses[-1]:.4f}, Val Acc={val_acc:.4f}")
 
     if val_acc > best_val_acc:
         best_val_acc = val_acc
         epochs_no_improve = 0
         torch.save(model.state_dict(), "best_model.pt")
-        print("✅ Best model saved.")
     else:
         epochs_no_improve += 1
         if epochs_no_improve >= patience:
-            print("⛔ Early stopping triggered.")
+            print("Early stopping.")
             break
 
-# Step 10: Evaluation
+# Evaluation
 model.load_state_dict(torch.load("best_model.pt"))
 model.eval()
-predictions, targets, texts = [], [], []
+predictions, targets, texts, confidences = [], [], [], []
 
 with torch.no_grad():
     for batch in val_loader:
@@ -167,41 +177,78 @@ with torch.no_grad():
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device)
         outputs = model(input_ids, attention_mask)
-        preds = torch.argmax(outputs, dim=1)
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+        confidence = torch.max(probs, dim=1).values
         predictions.extend(preds.cpu().numpy())
         targets.extend(labels.cpu().numpy())
+        confidences.extend(confidence.cpu().numpy())
         texts.extend(batch['text'])
 
+# Save predictions
+df_results = pd.DataFrame({
+    "Text": texts,
+    "True": [reverse_label_map[t] for t in targets],
+    "Predicted": [reverse_label_map[p] for p in predictions],
+    "Confidence": confidences
+})
+df_results.to_csv("model_predictions.csv", index=False)
+
+# Metrics
 unique_labels = sorted(set(targets + predictions))
 class_names_eval = [reverse_label_map[i] for i in unique_labels]
-
+report = classification_report(targets, predictions, target_names=class_names_eval, output_dict=True)
 print("\nClassification Report:")
-print(classification_report(targets, predictions, target_names=class_names_eval))
-print("Accuracy:", accuracy_score(targets, predictions))
+for label in class_names_eval:
+    print(f"{label}: Precision={report[label]['precision']:.2f}, Recall={report[label]['recall']:.2f}, F1={report[label]['f1-score']:.2f}")
+print("Overall Accuracy:", accuracy_score(targets, predictions))
 
+# Confusion Matrix (Raw + Normalized)
 cm = confusion_matrix(targets, predictions, labels=unique_labels)
-sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names_eval, yticklabels=class_names_eval)
-plt.title("Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
+cm_normalized = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
+
+sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', xticklabels=class_names_eval, yticklabels=class_names_eval, ax=ax1)
+ax1.set_title("Confusion Matrix (Counts)")
+ax1.set_xlabel("Predicted")
+ax1.set_ylabel("Actual")
+ax1.tick_params(axis='x', rotation=45)
+
+sns.heatmap(cm_normalized, annot=True, fmt='.2f', cmap='PuBu', xticklabels=class_names_eval, yticklabels=class_names_eval, ax=ax2)
+ax2.set_title("Normalized Confusion Matrix")
+ax2.set_xlabel("Predicted")
+ax2.set_ylabel("Actual")
+ax2.tick_params(axis='x', rotation=45)
+
 plt.tight_layout()
+plt.savefig("confusion_matrix_side_by_side.png")
 plt.show()
 
-cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
-sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues', xticklabels=class_names_eval, yticklabels=class_names_eval)
-plt.title("Normalized Confusion Matrix")
-plt.xlabel("Predicted")
-plt.ylabel("True")
+# Learning Curve
+fig, ax1 = plt.subplots(figsize=(10, 6))
+ax1.plot(train_losses, label='Train Loss', color='tab:blue', linestyle='--', marker='o')
+ax1.plot(val_losses, label='Validation Loss', color='tab:orange', linestyle='--', marker='s')
+ax1.set_xlabel('Epoch')
+ax1.set_ylabel('Loss')
+ax1.legend(loc='upper left')
+ax1.grid(True)
+
+ax2 = ax1.twinx()
+ax2.plot(val_accuracies, label='Validation Accuracy', color='tab:green', linestyle='-', marker='^')
+ax2.set_ylabel('Accuracy')
+ax2.legend(loc='upper right')
+
+plt.title("Model Learning Curve")
 plt.tight_layout()
+plt.savefig("learning_curve_combined.png")
 plt.show()
 
-# Plot Learning Curve
-plt.plot(train_losses, label='Training Loss')
-plt.plot(val_accuracies, label='Validation Accuracy')
-plt.title("Learning Curve")
-plt.xlabel("Epoch")
-plt.ylabel("Metric")
-plt.legend()
-plt.tight_layout()
-plt.savefig("learning_curve.png")
-plt.show()
+# Misclassified Examples
+print("\n❌ Top 5 Misclassified Samples (Lowest Confidence):")
+mismatches = [(texts[i], reverse_label_map[targets[i]], reverse_label_map[predictions[i]], confidences[i])
+              for i in range(len(predictions)) if predictions[i] != targets[i]]
+mismatches = sorted(mismatches, key=lambda x: x[3])
+for i, (text, true, pred, conf) in enumerate(mismatches[:5]):
+    print(f"[{i+1}] True: {true} | Predicted: {pred} | Confidence: {conf:.2f}")
+    print(f"Text: {text[:120]}...")
+    print("-" * 80)
