@@ -24,7 +24,7 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 np.random.seed(SEED)
 
-# Download and load dataset
+# Download and load dataset from kaggle
 print("Downloading dataset...")
 dataset_dir = kagglehub.dataset_download("souvikahmed071/social-media-and-mental-health")
 csv_file = next(f for f in os.listdir(dataset_dir) if f.endswith('.csv'))
