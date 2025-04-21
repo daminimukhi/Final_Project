@@ -1,4 +1,4 @@
-# Mental Health Prediction using BERT + BiLSTM (Final Polished Version)
+# Mental Health Prediction using BERT + BiLSTM 
 
 import os, random, re, numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
