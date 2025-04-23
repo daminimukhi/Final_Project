@@ -1,4 +1,4 @@
-# Mental Health Prediction using BERT + BiLSTM 
+# Mental Health Prediction using BERT + BiLSTM (Final Polished Version)
 
 import os, random, re, numpy as np, pandas as pd, torch, torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -132,11 +132,9 @@ class_names = [reverse_label_map[i] for i in all_labels]
 cm = confusion_matrix(targets, predictions, labels=all_labels)
 print("Confusion Matrix Raw Counts:\n", cm)
 
-cm_norm = np.zeros_like(cm, dtype=float)
-for i in range(len(cm)):
-    row_sum = cm[i].sum()
-    if row_sum > 0:
-        cm_norm[i] = cm[i] / row_sum
+# Normalize with safety against division by zero
+row_sums = cm.sum(axis=1, keepdims=True)
+cm_norm = np.divide(cm, row_sums, where=row_sums != 0)
 
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 sns.heatmap(cm, annot=True, fmt='d', cmap='Reds', xticklabels=class_names, yticklabels=class_names, ax=ax1)
