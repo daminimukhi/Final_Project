@@ -1,14 +1,14 @@
-# Mental Health Prediction using BERT + BiLSTM (Final Optimized Version)
+# Mental Health Prediction using BERT + BiLSTM (Fixed Input Issue)
 
 import os, random, re, numpy as np, pandas as pd, torch, torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from transformers import BertTokenizer, BertModel
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score
-from sklearn.utils.class_weight import compute_class_weight
 import matplotlib.pyplot as plt
 import seaborn as sns
 import kagglehub
+from torch.optim.lr_scheduler import OneCycleLR
 
 # Set seed
 SEED = 42
@@ -23,7 +23,7 @@ csv_file = next(f for f in os.listdir(dataset_dir) if f.endswith('.csv'))
 df = pd.read_csv(os.path.join(dataset_dir, csv_file))
 df.columns = df.columns.str.strip().str.lower().str.replace(' ', '_').str.replace(r'[^\w\s]', '', regex=True)
 
-# Text cleaning
+# Clean text
 def clean_text(text):
     text = str(text).lower()
     text = re.sub(r"http\S+", "", text)
@@ -31,6 +31,7 @@ def clean_text(text):
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+# Define columns
 text_col = '16_following_the_previous_question_how_do_you_feel_about_these_comparisons_generally_speaking'
 target_col = '13_on_a_scale_of_1_to_5_how_much_are_you_bothered_by_worries'
 df.dropna(subset=[text_col, target_col], inplace=True)
@@ -44,9 +45,7 @@ df['label'] = df[target_col].map(label_map)
 
 # Tokenizer
 tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-class_names = [reverse_label_map[i] for i in range(len(label_map))]
 
-# Dataset class
 class MentalHealthDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len=128):
         self.texts = texts
@@ -57,22 +56,38 @@ class MentalHealthDataset(Dataset):
     def __len__(self): return len(self.texts)
 
     def __getitem__(self, idx):
-        enc = self.tokenizer.encode_plus(str(self.texts[idx]), truncation=True, add_special_tokens=True,
-                                         max_length=self.max_len, padding='max_length', return_attention_mask=True,
-                                         return_tensors='pt')
+        text = str(self.texts[idx])  # Convert input to string safely
+        enc = self.tokenizer.encode_plus(
+            text,
+            truncation=True,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            return_attention_mask=True,
+            return_tensors='pt'
+        )
         return {
             'input_ids': enc['input_ids'].squeeze(),
             'attention_mask': enc['attention_mask'].squeeze(),
             'label': torch.tensor(self.labels[idx], dtype=torch.long),
-            'text': self.texts[idx]
+            'text': text
         }
 
 # Prepare data
 texts = df[text_col].tolist()
 labels = df['label'].tolist()
 X_train, X_val, y_train, y_val = train_test_split(texts, labels, test_size=0.2, stratify=labels, random_state=SEED)
-train_loader = DataLoader(MentalHealthDataset(X_train, y_train, tokenizer), batch_size=16, shuffle=True)
-val_loader = DataLoader(MentalHealthDataset(X_val, y_val, tokenizer), batch_size=16)
+train_dataset = MentalHealthDataset(X_train, y_train, tokenizer)
+val_dataset = MentalHealthDataset(X_val, y_val, tokenizer)
+
+# Weighted sampler
+class_counts = np.bincount(y_train)
+class_weights = 1. / class_counts
+sample_weights = class_weights[y_train]
+sampler = WeightedRandomSampler(weights=sample_weights, num_samples=len(sample_weights), replacement=True)
+
+train_loader = DataLoader(train_dataset, batch_size=16, sampler=sampler)
+val_loader = DataLoader(val_dataset, batch_size=16)
 
 # Model
 class BERT_LSTM(nn.Module):
@@ -89,68 +104,65 @@ class BERT_LSTM(nn.Module):
         pooled = torch.mean(lstm_out, dim=1)
         return self.fc(self.dropout(pooled))
 
-# Training setup
+# Model setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = BERT_LSTM().to(device)
-weights = compute_class_weight('balanced', classes=np.unique(labels), y=labels)
-criterion = nn.CrossEntropyLoss(weight=torch.tensor(weights, dtype=torch.float).to(device))
-optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
-scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+criterion = nn.CrossEntropyLoss()
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+scheduler = OneCycleLR(optimizer, max_lr=5e-5, steps_per_epoch=len(train_loader), epochs=30, anneal_strategy='linear')
 
-best_val_f1, patience, epochs_no_improve = 0.0, 5, 0
-train_losses, val_losses, val_accuracies = [], [], []
+# Training
+best_f1, patience, epochs_no_improve = 0.0, 5, 0
+train_losses, val_losses, val_accuracies, val_f1_scores = [], [], [], []
 
-for epoch in range(60):
+for epoch in range(30):
     model.train(); total_loss = 0
     for batch in train_loader:
-        input_ids, mask, targets = batch['input_ids'].to(device), batch['attention_mask'].to(device), batch['label'].to(device)
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['label'].to(device)
         optimizer.zero_grad()
-        loss = criterion(model(input_ids, mask), targets)
-        loss.backward(); optimizer.step()
+        outputs = model(input_ids, attention_mask)
+        loss = criterion(outputs, labels)
+        loss.backward(); optimizer.step(); scheduler.step()
         total_loss += loss.item()
     train_losses.append(total_loss / len(train_loader))
 
     model.eval(); predictions, targets_val, val_loss_total = [], [], 0
     with torch.no_grad():
         for batch in val_loader:
-            input_ids, mask = batch['input_ids'].to(device), batch['attention_mask'].to(device)
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
             labels = batch['label'].to(device)
-            out = model(input_ids, mask)
-            val_loss_total += criterion(out, labels).item()
-            predictions.extend(torch.argmax(out, dim=1).cpu().numpy())
+            outputs = model(input_ids, attention_mask)
+            val_loss_total += criterion(outputs, labels).item()
+            predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
             targets_val.extend(labels.cpu().numpy())
+
     val_acc = accuracy_score(targets_val, predictions)
-    val_f1 = f1_score(targets_val, predictions, average='macro')
+    val_f1 = f1_score(targets_val, predictions, average='weighted')
     val_losses.append(val_loss_total / len(val_loader))
     val_accuracies.append(val_acc)
-    scheduler.step(val_losses[-1])
+    val_f1_scores.append(val_f1)
+
     print(f"Epoch {epoch+1}: Train Loss={train_losses[-1]:.4f}, Val Loss={val_losses[-1]:.4f}, Val Acc={val_acc:.4f}, Val F1={val_f1:.4f}")
 
-    if val_f1 > best_val_f1:
-        best_val_f1 = val_f1
-        epochs_no_improve = 0
-        torch.save(model.state_dict(), "best_model.pt")
-    else:
-        epochs_no_improve += 1
-        if epochs_no_improve >= patience:
-            print("Early stopping."); break
+    if val_f1 > best_f1: best_f1, epochs_no_improve = val_f1, 0; torch.save(model.state_dict(), "best_model.pt")
+    else: epochs_no_improve += 1
+    if epochs_no_improve >= patience: print("Early stopping."); break
 
 # Evaluation
 model.load_state_dict(torch.load("best_model.pt")); model.eval()
-predictions, targets, texts, confidences = [], [], [], []
+predictions, targets = [], []
 with torch.no_grad():
     for batch in val_loader:
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device)
         outputs = model(input_ids, attention_mask)
-        probs = torch.softmax(outputs, dim=1)
-        predictions.extend(torch.argmax(probs, dim=1).cpu().numpy())
+        predictions.extend(torch.argmax(outputs, dim=1).cpu().numpy())
         targets.extend(labels.cpu().numpy())
-        confidences.extend(torch.max(probs, dim=1).values.cpu().numpy())
-        texts.extend(batch['text'])
 
-# Confusion matrix
 class_names = [reverse_label_map[i] for i in range(len(label_map))]
 cm = confusion_matrix(targets, predictions, labels=list(range(len(label_map))))
 row_sums = cm.sum(axis=1, keepdims=True)
@@ -167,13 +179,3 @@ sns.heatmap(cm_norm, annot=True, fmt='.2f', cmap='Blues', xticklabels=class_name
 ax2.set_title("Normalized Confusion Matrix"); ax2.set_xlabel("Predicted"); ax2.set_ylabel("Actual")
 
 plt.tight_layout(); plt.savefig("confusion_matrix_side_by_side.png"); plt.show()
-
-# Learning curve
-plt.figure(figsize=(10, 6))
-plt.plot(train_losses, label='Train Loss', linestyle='--', marker='o')
-plt.plot(val_losses, label='Val Loss', linestyle='--', marker='s')
-plt.plot(val_accuracies, label='Val Accuracy', marker='^')
-plt.title("Model Learning Curve"); plt.xlabel("Epoch"); plt.ylabel("Score")
-plt.legend(); plt.grid(True)
-plt.tight_layout(); plt.savefig("learning_curve_combined.png")
-plt.show()
