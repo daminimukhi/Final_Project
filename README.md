@@ -1,19 +1,19 @@
 # Mental Health Prediction from Social Media Responses
 
-This project predicts the mental health impact level based on user responses about their social media usage using a BERT + BiLSTM model.
+This project predicts a user's mental health impact level based on their social media behavior using a deep learning model (BERT + BiLSTM).
 
-## Structure
-- `train_and_evaluate.py`: Train and evaluate the BERT + BiLSTM model.
-- `project_gui.py`: Launch an interactive GUI for self-assessment.
-- `models/`: Model definition.
-- `utils/`: Dataset preprocessing helpers.
-- `assets/`: GUI background image.
-- `saved_models/`: Trained model storage.
-- `report/`: Final project report (LaTeX).
+## Project Structure
+- `train_and_evaluate.py` — Train and evaluate the model on real-world survey data.
+- `project.py` — Launch a GUI (Tkinter app) for self-assessment.
+- `saved_models/` — Stores the trained model.
+- `assets/` — Stores the background image for the GUI.
+- `report/` — Contains the final project report in LaTeX format.
 
-## Setup
+## Setup Instructions
 
-1. Install requirements:
+1. **Install Dependencies**  
+Make sure you have Python 3.8+ installed.  
+Then install required libraries:
 ```bash
 pip install -r requirements.txt
 
